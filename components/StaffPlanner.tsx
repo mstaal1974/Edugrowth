@@ -100,7 +100,7 @@ const getSalesUnitOutput = (monthsActive: number): number => {
     let totalMonthlyUnits = 0;
 
     // We assume the salesperson makes 1 sale every month they are active (0, 1, 2, ... monthsActive)
-    // We iterate through every sale they have made up to this point
+    // We iterate through every sale they have made up to this point to see if it's paying out now
     for (let saleMonthIndex = 0; saleMonthIndex <= monthsActive; saleMonthIndex++) {
         // Calculate the payout window for this specific sale
         const payoutStart = saleMonthIndex + delay;
@@ -179,6 +179,15 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
     const baseline = data.operationalFinancials;
     if (baseline.length === 0) return [];
 
+    // Pre-calculate start indices for all valid events to avoid lookups inside the loop
+    const validEvents = hiringEvents
+      .map(ev => ({
+        ...ev,
+        startIndex: scheduleMonths.indexOf(ev.startMonth),
+        count: Number(ev.count) // Force number here for safety
+      }))
+      .filter(ev => ev.startIndex !== -1);
+
     let runningBalance = baseline[0].openingBalance;
     
     return baseline.map((op, index) => {
@@ -187,33 +196,28 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
         let generatedUnits = 0;
         let generatedRevenue = 0;
 
-        hiringEvents.forEach(hEvent => {
-            // Use direct array index lookup on scheduleMonths to find the start index
-            // This ensures we are matching the exact string selected in the dropdown
-            const startIdx = scheduleMonths.indexOf(hEvent.startMonth);
-            
-            // Check if startIdx is valid (-1 is invalid) and current index is past the start date
-            if (startIdx !== -1 && index >= startIdx) {
+        validEvents.forEach(ev => {
+            // Check if current timeline index is at or after the start index
+            if (index >= ev.startIndex) {
                 // 1. Cost Calculation
-                const costPerHead = getMonthlyCostForRole(hEvent.roleId);
-                const hireCount = hEvent.count;
-                monthlyStaffCost += (costPerHead * hireCount);
-                activeHeadcount += hireCount;
+                const costPerHead = getMonthlyCostForRole(ev.roleId);
+                monthlyStaffCost += (costPerHead * ev.count);
+                activeHeadcount += ev.count;
 
                 // 2. Revenue Calculation (Trainers & Sales)
                 let unitsPerPerson = 0;
                 
-                if (hEvent.roleId === 'trainer') {
-                    const monthsActive = index - startIdx;
+                if (ev.roleId === 'trainer') {
+                    const monthsActive = index - ev.startIndex;
                     unitsPerPerson = getTrainerUnitOutput(monthsActive);
-                } else if (hEvent.roleId === 'sales') {
-                    const monthsActive = index - startIdx;
+                } else if (ev.roleId === 'sales') {
+                    const monthsActive = index - ev.startIndex;
                     unitsPerPerson = getSalesUnitOutput(monthsActive);
                 }
 
                 if (unitsPerPerson > 0) {
-                    const totalNewUnits = unitsPerPerson * hireCount;
-                    const unitValue = regionUnitValues.get(hEvent.region) || 0;
+                    const totalNewUnits = unitsPerPerson * ev.count;
+                    const unitValue = regionUnitValues.get(ev.region) || 0;
                     
                     generatedUnits += totalNewUnits;
                     generatedRevenue += (totalNewUnits * unitValue);
@@ -225,6 +229,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
         const newNetCashflow = (op.netCashflow + generatedRevenue) - monthlyStaffCost;
         
         // Recalculate Balance
+        // For index 0, use original opening. For others, use running balance from previous iteration.
         const opening = index === 0 ? op.openingBalance : runningBalance;
         const closing = opening + newNetCashflow;
         runningBalance = closing;
@@ -424,7 +429,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex-1 min-h-[350px]">
                     <h3 className="font-bold text-slate-800 mb-6">Net Cashflow & Bank Balance Impact</h3>
                     <ResponsiveContainer width="100%" height="100%">
-                        <ComposedChart data={projectionData} margin={{top: 10, right: 30, left: 0, bottom: 0}}>
+                        <ComposedChart key={`balance-chart-${hiringEvents.length}`} data={projectionData} margin={{top: 10, right: 30, left: 0, bottom: 0}}>
                             <defs>
                                 <linearGradient id="splitColor" x1="0" y1="0" x2="0" y2="1">
                                     <stop offset="5%" stopColor="#6366f1" stopOpacity={0.1}/>
@@ -474,7 +479,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 h-80">
                     <h3 className="font-bold text-slate-800 mb-4">Staff Costs vs. Generated Revenue (ROI)</h3>
                      <ResponsiveContainer width="100%" height="100%">
-                        <ComposedChart data={projectionData}>
+                        <ComposedChart key={`roi-chart-${hiringEvents.length}`} data={projectionData}>
                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                             <XAxis dataKey="month" fontSize={11} tickLine={false} axisLine={false} minTickGap={30} />
                             <YAxis fontSize={11} tickLine={false} axisLine={false} tickFormatter={(val) => `$${val/1000}k`} />
