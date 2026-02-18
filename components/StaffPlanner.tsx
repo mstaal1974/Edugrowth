@@ -1,9 +1,9 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { DashboardData, StaffRole } from '../types';
 import { 
-  ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area
+  ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, Bar
 } from 'recharts';
-import { Users, Calculator, Plus, Trash2, CalendarClock, AlertCircle } from 'lucide-react';
+import { Users, Calculator, Plus, Trash2, CalendarClock, AlertCircle, MapPin, TrendingUp, DollarSign } from 'lucide-react';
 
 interface Props {
   data: DashboardData;
@@ -14,6 +14,7 @@ interface HiringEvent {
   roleId: string;
   count: number;
   startMonth: string;
+  region: string; // Mandatory for calculations
 }
 
 // Configuration based on user requirements
@@ -79,28 +80,82 @@ const getMonthlyCostForRole = (roleId: string): number => {
     return (annualBase + annualAllowances + annualSuper + annualPayrollTax) / 12;
 };
 
+// Trainer Ramp Up Logic
+const getTrainerUnitOutput = (monthsActive: number): number => {
+    if (monthsActive < 0) return 0;
+    if (monthsActive < 2) return 10; // Month 1 & 2
+    if (monthsActive === 2) return 20; // Month 3
+    return 40; // Month 4+
+};
+
+// Sales Logic: 1 Sale/Mo, 400 Units Total, 3 Mo Delay, 12 Mo Distribution
+const getSalesUnitOutput = (monthsActive: number): number => {
+    if (monthsActive < 0) return 0;
+
+    const unitsPerSale = 400;
+    const payoutDuration = 12; // Distributed over 12 months
+    const delay = 3; // Starts paying 3 months after sale
+    const unitsPerMonthPerSale = unitsPerSale / payoutDuration; // ~33.33 units
+
+    let totalMonthlyUnits = 0;
+
+    // We assume the salesperson makes 1 sale every month they are active (0, 1, 2, ... monthsActive)
+    // We iterate through every sale they have made up to this point
+    for (let saleMonthIndex = 0; saleMonthIndex <= monthsActive; saleMonthIndex++) {
+        // Calculate the payout window for this specific sale
+        const payoutStart = saleMonthIndex + delay;
+        const payoutEnd = payoutStart + payoutDuration; // Exclusive
+
+        // If the current time (monthsActive) is within the window of this sale's payout
+        if (monthsActive >= payoutStart && monthsActive < payoutEnd) {
+            totalMonthlyUnits += unitsPerMonthPerSale;
+        }
+    }
+
+    return totalMonthlyUnits;
+};
+
 const StaffPlanner: React.FC<Props> = ({ data }) => {
+  // Use operational financials as the master timeline to ensure chart alignment
+  const scheduleMonths = useMemo(() => data.operationalFinancials.map(op => op.month), [data.operationalFinancials]);
+  const regions = useMemo(() => data.regions.map(r => r.region).filter(r => r !== 'Total' && r !== 'Other Income'), [data.regions]);
+
+  // Calculate Average Revenue Per Unit Per Region (Historical Baseline)
+  const regionUnitValues = useMemo(() => {
+    const map = new Map<string, number>();
+    data.regions.forEach(r => {
+        const totalRev = r.totalRevenue;
+        const totalUnits = r.totalUnits;
+        const avgVal = totalUnits > 0 ? totalRev / totalUnits : 0;
+        map.set(r.region, avgVal);
+    });
+    return map;
+  }, [data.regions]);
+
   // State for hiring events
   const [hiringEvents, setHiringEvents] = useState<HiringEvent[]>([]);
   
   // Form State
   const [selectedRole, setSelectedRole] = useState(STAFF_ROLES[0].id);
   const [count, setCount] = useState(1);
-  // Robust initialization of startMonth to ensure it matches data.months keys
-  const [startMonth, setStartMonth] = useState<string>(data.months.length > 0 ? data.months[0] : '');
+  const [startMonth, setStartMonth] = useState<string>('');
+  const [selectedRegion, setSelectedRegion] = useState<string>(regions[0] || '');
 
-  // Effect to ensure startMonth is set properly if data loads asynchronously or changes
+  // Robust initialization
   useEffect(() => {
-    if (!startMonth && data.months.length > 0) {
-      setStartMonth(data.months[0]);
+    if (scheduleMonths.length > 0 && !startMonth) {
+      setStartMonth(scheduleMonths[0]);
     }
-  }, [data.months, startMonth]);
+    if (regions.length > 0 && !selectedRegion) {
+        setSelectedRegion(regions[0]);
+    }
+  }, [scheduleMonths, startMonth, regions, selectedRegion]);
 
   const formatCurrency = (val: number) => 
     new Intl.NumberFormat('en-AU', { style: 'currency', currency: 'AUD', maximumFractionDigits: 0 }).format(val);
 
   const addEvent = useCallback(() => {
-    const effectiveStartMonth = startMonth || (data.months.length > 0 ? data.months[0] : '');
+    const effectiveStartMonth = startMonth || (scheduleMonths.length > 0 ? scheduleMonths[0] : '');
     
     if (!effectiveStartMonth) return;
 
@@ -108,48 +163,67 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
         id: Math.random().toString(36).substr(2, 9),
         roleId: selectedRole,
         count: Number(count),
-        startMonth: effectiveStartMonth
+        startMonth: effectiveStartMonth,
+        region: selectedRegion
     };
     setHiringEvents(prev => [...prev, newEvent]);
-  }, [selectedRole, count, startMonth, data.months]);
+  }, [selectedRole, count, startMonth, scheduleMonths, selectedRegion]);
 
   const removeEvent = useCallback((id: string) => {
     setHiringEvents(prev => prev.filter(e => e.id !== id));
   }, []);
 
   // Project Financials
-  // Uses strict index comparison to ensure costs are applied correctly along the timeline
   const projectionData = useMemo(() => {
     const baseline = data.operationalFinancials;
     if (baseline.length === 0) return [];
+
+    const monthToIndex = new Map(baseline.map((op, i) => [op.month, i] as [string, number]));
 
     let runningBalance = baseline[0].openingBalance;
     
     return baseline.map((op, index) => {
         let monthlyStaffCost = 0;
         let activeHeadcount = 0;
-        
-        // Use the current loop index as the time cursor.
-        // This assumes baseline (operationalFinancials) maps 1:1 to data.months, which is true by design.
-        const currentIdx = index;
+        let generatedUnits = 0;
+        let generatedRevenue = 0;
 
-        hiringEvents.forEach(event => {
-            // Find when this event starts in the master month list
-            const startIdx = data.months.indexOf(event.startMonth);
+        hiringEvents.forEach(hEvent => {
+            const startIdx = monthToIndex.get(hEvent.startMonth);
             
-            // Apply cost if valid start found AND current month is on or after start
-            if (startIdx !== -1 && currentIdx >= startIdx) {
-                const costPerHead = getMonthlyCostForRole(event.roleId);
-                monthlyStaffCost += (costPerHead * event.count);
-                activeHeadcount += event.count;
+            // Check if startIdx is defined and current index is past the start date
+            if (startIdx !== undefined && index >= startIdx) {
+                // 1. Cost Calculation
+                const costPerHead = getMonthlyCostForRole(hEvent.roleId);
+                const hireCount = Number(hEvent.count); // Ensure number type
+                monthlyStaffCost += (costPerHead * hireCount);
+                activeHeadcount += hireCount;
+
+                // 2. Revenue Calculation (Trainers & Sales)
+                let unitsPerPerson = 0;
+                
+                if (hEvent.roleId === 'trainer') {
+                    const monthsActive = index - startIdx;
+                    unitsPerPerson = getTrainerUnitOutput(monthsActive);
+                } else if (hEvent.roleId === 'sales') {
+                    const monthsActive = index - startIdx;
+                    unitsPerPerson = getSalesUnitOutput(monthsActive);
+                }
+
+                if (unitsPerPerson > 0) {
+                    const totalNewUnits = unitsPerPerson * hireCount;
+                    const unitValue = regionUnitValues.get(hEvent.region) || 0;
+                    
+                    generatedUnits += totalNewUnits;
+                    generatedRevenue += (totalNewUnits * unitValue);
+                }
             }
         });
 
-        // Apply Impact
-        const newNetCashflow = op.netCashflow - monthlyStaffCost;
+        // Apply Impact: Revenue increases cashflow, Staff Cost decreases it
+        const newNetCashflow = (op.netCashflow + generatedRevenue) - monthlyStaffCost;
         
         // Recalculate Balance
-        // If first month, use original opening balance. Else use running balance from previous iteration.
         const opening = index === 0 ? op.openingBalance : runningBalance;
         const closing = opening + newNetCashflow;
         runningBalance = closing;
@@ -161,12 +235,18 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
             baselineCashflow: op.netCashflow,
             projectedCashflow: newNetCashflow,
             staffCost: monthlyStaffCost,
+            generatedRevenue: generatedRevenue,
+            generatedUnits: generatedUnits,
             headcount: activeHeadcount
         };
     });
-  }, [data.operationalFinancials, data.months, hiringEvents]);
+  }, [data.operationalFinancials, hiringEvents, regionUnitValues]);
 
   const totalProjectedCost = projectionData.reduce((acc, curr) => acc + curr.staffCost, 0);
+  const totalGeneratedRevenue = projectionData.reduce((acc, curr) => acc + curr.generatedRevenue, 0);
+  const netImpact = totalGeneratedRevenue - totalProjectedCost;
+
+  const isRevenueGeneratingRole = selectedRole === 'trainer' || selectedRole === 'sales';
 
   return (
     <div className="flex flex-col h-full space-y-6">
@@ -179,13 +259,13 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
             <h2 className="text-xl font-bold text-slate-800">Timeline Staff Planner</h2>
         </div>
         <p className="text-sm text-slate-500">
-            Schedule staff hires at specific months to see the cash flow impact over time.
+            Schedule staff hires and model revenue ramp-up for trainers and sales staff.
         </p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-0 flex-1">
           {/* Controls */}
-          <div className="lg:col-span-5 space-y-6 overflow-y-auto pr-2">
+          <div className="lg:col-span-4 space-y-6 overflow-y-auto pr-2">
               {/* Form */}
               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
                   <h3 className="font-semibold text-slate-800 mb-4 flex items-center gap-2">
@@ -203,6 +283,34 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                                   <option key={r.id} value={r.id}>{r.label} ({formatCurrency(r.baseWage)})</option>
                               ))}
                           </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-500 mb-1">Allocation Region</label>
+                        <div className="relative">
+                            <MapPin size={14} className="absolute left-3 top-2.5 text-slate-400" />
+                            <select 
+                                value={selectedRegion}
+                                onChange={(e) => setSelectedRegion(e.target.value)}
+                                className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                            >
+                                {regions.map(r => (
+                                    <option key={r} value={r}>{r}</option>
+                                ))}
+                            </select>
+                        </div>
+                        {isRevenueGeneratingRole && (
+                             <div className="mt-2 text-[10px] text-slate-500 bg-slate-50 p-2 rounded border border-slate-100">
+                                <p className="font-semibold text-emerald-600 mb-1 flex items-center gap-1">
+                                    <TrendingUp size={10} /> Revenue Model Active
+                                </p>
+                                {selectedRole === 'sales' ? (
+                                    <span>Model: 1 Sale/Mo (400 units). Starts paying 3 months later, distributed over 12 months. Sales stack cumulatively.</span>
+                                ) : (
+                                    <span>Model: 10 units (M1-2), 20 units (M3), 40 units (M4+) flat ramp up.</span>
+                                )}
+                             </div>
+                        )}
                       </div>
 
                       <div className="grid grid-cols-2 gap-4">
@@ -223,7 +331,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                                 onChange={(e) => setStartMonth(e.target.value)}
                                 className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
                             >
-                                {data.months.map(m => (
+                                {scheduleMonths.map(m => (
                                     <option key={m} value={m}>{m}</option>
                                 ))}
                             </select>
@@ -253,19 +361,20 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                     <div className="space-y-3">
                         {hiringEvents.map((event) => {
                             const role = STAFF_ROLES.find(r => r.id === event.roleId);
+                            const generatesRevenue = event.roleId === 'trainer' || event.roleId === 'sales';
                             return (
-                                <div key={event.id} className="flex justify-between items-center p-3 bg-slate-50 rounded-lg border border-slate-200">
-                                    <div>
-                                        <p className="font-bold text-slate-800 text-sm">
-                                            {event.count}x {role?.label}
-                                        </p>
-                                        <p className="text-xs text-slate-500">Starts: {event.startMonth}</p>
-                                    </div>
-                                    <div className="flex items-center gap-3">
-                                        <div className="text-right">
-                                            <p className="text-xs font-medium text-slate-700">
-                                                {formatCurrency(getMonthlyCostForRole(event.roleId) * event.count)}/mo
-                                            </p>
+                                <div key={event.id} className="p-3 bg-slate-50 rounded-lg border border-slate-200">
+                                    <div className="flex justify-between items-start">
+                                        <div>
+                                            <div className="flex items-center gap-2">
+                                                <span className="font-bold text-slate-800 text-sm">
+                                                    {event.count}x {role?.label}
+                                                </span>
+                                                <span className="text-[10px] bg-slate-200 px-1.5 py-0.5 rounded text-slate-600">
+                                                    {event.region}
+                                                </span>
+                                            </div>
+                                            <p className="text-xs text-slate-500 mt-0.5">Starts: {event.startMonth}</p>
                                         </div>
                                         <button 
                                             onClick={() => removeEvent(event.id)}
@@ -274,21 +383,35 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                                             <Trash2 size={16} />
                                         </button>
                                     </div>
+                                    <div className="flex justify-between items-center mt-2 pt-2 border-t border-slate-200">
+                                        <p className="text-xs text-rose-600 font-medium">
+                                            -{formatCurrency(getMonthlyCostForRole(event.roleId) * event.count)}/mo
+                                        </p>
+                                        {generatesRevenue && (
+                                            <p className="text-xs text-emerald-600 font-medium flex items-center gap-1">
+                                                <TrendingUp size={12} /> Revenue Active
+                                            </p>
+                                        )}
+                                    </div>
                                 </div>
                             );
                         })}
                         
-                        <div className="pt-4 border-t border-slate-100 mt-2">
-                             <div className="flex justify-between items-center">
-                                 <span className="text-sm text-slate-500">Total Projection Impact</span>
-                                 <span className="font-bold text-rose-600 text-lg">{formatCurrency(totalProjectedCost)}</span>
+                        <div className="pt-4 border-t border-slate-100 mt-4 space-y-2">
+                             <div className="flex justify-between items-center text-sm">
+                                 <span className="text-slate-500">Projected Cost</span>
+                                 <span className="font-medium text-rose-600">{formatCurrency(totalProjectedCost)}</span>
                              </div>
-                             <p className="text-xs text-slate-400 mt-1 text-right">Cumulative cost across entire period</p>
-                        </div>
-                        
-                        <div className="text-xs text-slate-400 mt-2 flex items-start gap-1 pt-2">
-                            <AlertCircle size={12} className="mt-0.5" />
-                            <p>Includes allowances, 12% Super & 5.5% Payroll Tax.</p>
+                             <div className="flex justify-between items-center text-sm">
+                                 <span className="text-slate-500">Generated Revenue</span>
+                                 <span className="font-medium text-emerald-600">{formatCurrency(totalGeneratedRevenue)}</span>
+                             </div>
+                             <div className="flex justify-between items-center border-t border-slate-200 pt-2">
+                                 <span className="font-bold text-slate-700">Net Impact</span>
+                                 <span className={`font-bold text-lg ${netImpact >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                     {netImpact > 0 ? '+' : ''}{formatCurrency(netImpact)}
+                                 </span>
+                             </div>
                         </div>
                     </div>
                   )}
@@ -296,15 +419,15 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
           </div>
 
           {/* Visualization */}
-          <div className="lg:col-span-7 flex flex-col space-y-6">
-               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex-1 min-h-[400px]">
-                    <h3 className="font-bold text-slate-800 mb-6">Projected Bank Balance Impact</h3>
+          <div className="lg:col-span-8 flex flex-col space-y-6">
+               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex-1 min-h-[350px]">
+                    <h3 className="font-bold text-slate-800 mb-6">Net Cashflow & Bank Balance Impact</h3>
                     <ResponsiveContainer width="100%" height="100%">
                         <ComposedChart data={projectionData} margin={{top: 10, right: 30, left: 0, bottom: 0}}>
                             <defs>
                                 <linearGradient id="splitColor" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="5%" stopColor="#ef4444" stopOpacity={0.1}/>
-                                    <stop offset="95%" stopColor="#ef4444" stopOpacity={0}/>
+                                    <stop offset="5%" stopColor="#6366f1" stopOpacity={0.1}/>
+                                    <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
                                 </linearGradient>
                             </defs>
                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
@@ -332,8 +455,8 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                             <Line 
                                 type="monotone" 
                                 dataKey="projectedBalance" 
-                                name="With Staff Plan" 
-                                stroke="#ef4444" 
+                                name="Projected Balance" 
+                                stroke="#6366f1" 
                                 strokeWidth={3} 
                                 dot={false} 
                             />
@@ -347,37 +470,41 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                     </ResponsiveContainer>
                </div>
 
-               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 h-72">
-                    <h3 className="font-bold text-slate-800 mb-4">Staff Costs & Headcount Timeline</h3>
+               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 h-80">
+                    <h3 className="font-bold text-slate-800 mb-4">Staff Costs vs. Generated Revenue (ROI)</h3>
                      <ResponsiveContainer width="100%" height="100%">
                         <ComposedChart data={projectionData}>
                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                             <XAxis dataKey="month" fontSize={11} tickLine={false} axisLine={false} minTickGap={30} />
-                            <YAxis yAxisId="left" fontSize={11} tickLine={false} axisLine={false} tickFormatter={(val) => `$${val/1000}k`} />
-                            <YAxis yAxisId="right" orientation="right" fontSize={11} tickLine={false} axisLine={false} />
+                            <YAxis fontSize={11} tickLine={false} axisLine={false} tickFormatter={(val) => `$${val/1000}k`} />
                             
                             <Tooltip 
-                                formatter={(value: number, name: string) => name === 'Headcount' ? value : formatCurrency(value)} 
+                                formatter={(value: number) => formatCurrency(value)} 
                                 contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
                             />
                             <Legend />
                             
                             <Area 
-                                yAxisId="left"
                                 type="step" 
                                 dataKey="staffCost" 
-                                name="Monthly Staff Cost" 
+                                name="Staff Cost" 
                                 fill="#fecaca" 
                                 stroke="#ef4444" 
                             />
+                             <Area 
+                                type="step" 
+                                dataKey="generatedRevenue" 
+                                name="New Revenue" 
+                                fill="#d1fae5" 
+                                stroke="#10b981" 
+                            />
                             <Line 
-                                yAxisId="right"
-                                type="step"
-                                dataKey="headcount"
-                                name="Headcount"
-                                stroke="#6366f1"
-                                strokeWidth={2}
-                                dot={false}
+                                type="monotone" 
+                                dataKey="projectedCashflow" 
+                                name="Net Cashflow" 
+                                stroke="#3b82f6" 
+                                strokeWidth={2} 
+                                dot={false} 
                             />
                         </ComposedChart>
                     </ResponsiveContainer>
