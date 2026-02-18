@@ -155,6 +155,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
     new Intl.NumberFormat('en-AU', { style: 'currency', currency: 'AUD', maximumFractionDigits: 0 }).format(val);
 
   const addEvent = useCallback(() => {
+    // Ensure we have a valid start month
     const effectiveStartMonth = startMonth || (scheduleMonths.length > 0 ? scheduleMonths[0] : '');
     
     if (!effectiveStartMonth) return;
@@ -162,7 +163,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
     const newEvent: HiringEvent = {
         id: Math.random().toString(36).substr(2, 9),
         roleId: selectedRole,
-        count: Number(count),
+        count: Math.max(1, Number(count)),
         startMonth: effectiveStartMonth,
         region: selectedRegion
     };
@@ -178,8 +179,6 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
     const baseline = data.operationalFinancials;
     if (baseline.length === 0) return [];
 
-    const monthToIndex = new Map(baseline.map((op, i) => [op.month, i] as [string, number]));
-
     let runningBalance = baseline[0].openingBalance;
     
     return baseline.map((op, index) => {
@@ -189,13 +188,15 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
         let generatedRevenue = 0;
 
         hiringEvents.forEach(hEvent => {
-            const startIdx = monthToIndex.get(hEvent.startMonth);
+            // Use direct array index lookup on scheduleMonths to find the start index
+            // This ensures we are matching the exact string selected in the dropdown
+            const startIdx = scheduleMonths.indexOf(hEvent.startMonth);
             
-            // Check if startIdx is defined and current index is past the start date
-            if (startIdx !== undefined && index >= startIdx) {
+            // Check if startIdx is valid (-1 is invalid) and current index is past the start date
+            if (startIdx !== -1 && index >= startIdx) {
                 // 1. Cost Calculation
                 const costPerHead = getMonthlyCostForRole(hEvent.roleId);
-                const hireCount = Number(hEvent.count); // Ensure number type
+                const hireCount = hEvent.count;
                 monthlyStaffCost += (costPerHead * hireCount);
                 activeHeadcount += hireCount;
 
@@ -240,7 +241,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
             headcount: activeHeadcount
         };
     });
-  }, [data.operationalFinancials, hiringEvents, regionUnitValues]);
+  }, [data.operationalFinancials, hiringEvents, regionUnitValues, scheduleMonths]);
 
   const totalProjectedCost = projectionData.reduce((acc, curr) => acc + curr.staffCost, 0);
   const totalGeneratedRevenue = projectionData.reduce((acc, curr) => acc + curr.generatedRevenue, 0);
