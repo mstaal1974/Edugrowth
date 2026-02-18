@@ -3,7 +3,7 @@ import { DashboardData, StaffRole } from '../types';
 import { 
   ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, Bar
 } from 'recharts';
-import { Users, Calculator, Plus, Trash2, CalendarClock, AlertCircle, MapPin, TrendingUp, DollarSign } from 'lucide-react';
+import { Users, Calculator, Plus, Trash2, CalendarClock, AlertCircle, MapPin, TrendingUp, DollarSign, ArrowRight, Wallet, Activity } from 'lucide-react';
 
 interface Props {
   data: DashboardData;
@@ -132,8 +132,33 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
     return map;
   }, [data.regions]);
 
-  // State for hiring events
-  const [hiringEvents, setHiringEvents] = useState<HiringEvent[]>([]);
+  // State for hiring events - Initialize from LocalStorage
+  const [hiringEvents, setHiringEvents] = useState<HiringEvent[]>(() => {
+    try {
+      const saved = localStorage.getItem('staff_hiring_plan');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      console.error("Failed to load hiring plan", e);
+      return [];
+    }
+  });
+
+  // State for Analysis Period
+  const [analysisStart, setAnalysisStart] = useState<string>('');
+  const [analysisEnd, setAnalysisEnd] = useState<string>('');
+
+  // Initialize Analysis Period defaults
+  useEffect(() => {
+    if (scheduleMonths.length > 0) {
+        if (!analysisStart) setAnalysisStart(scheduleMonths[0]);
+        if (!analysisEnd) setAnalysisEnd(scheduleMonths[scheduleMonths.length - 1]);
+    }
+  }, [scheduleMonths]);
+
+  // Save to LocalStorage whenever events change
+  useEffect(() => {
+    localStorage.setItem('staff_hiring_plan', JSON.stringify(hiringEvents));
+  }, [hiringEvents]);
   
   // Form State
   const [selectedRole, setSelectedRole] = useState(STAFF_ROLES[0].id);
@@ -174,17 +199,18 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
     setHiringEvents(prev => prev.filter(e => e.id !== id));
   }, []);
 
-  // Project Financials
+  // Project Financials (FULL TIMELINE)
+  // We calculate the full timeline first to ensure cumulative balances are correct
   const projectionData = useMemo(() => {
     const baseline = data.operationalFinancials;
     if (baseline.length === 0) return [];
 
-    // Pre-calculate start indices for all valid events to avoid lookups inside the loop
+    // Pre-calculate start indices for all valid events
     const validEvents = hiringEvents
       .map(ev => ({
         ...ev,
         startIndex: scheduleMonths.indexOf(ev.startMonth),
-        count: Number(ev.count) // Force number here for safety
+        count: Number(ev.count) 
       }))
       .filter(ev => ev.startIndex !== -1);
 
@@ -197,14 +223,13 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
         let generatedRevenue = 0;
 
         validEvents.forEach(ev => {
-            // Check if current timeline index is at or after the start index
             if (index >= ev.startIndex) {
                 // 1. Cost Calculation
                 const costPerHead = getMonthlyCostForRole(ev.roleId);
                 monthlyStaffCost += (costPerHead * ev.count);
                 activeHeadcount += ev.count;
 
-                // 2. Revenue Calculation (Trainers & Sales)
+                // 2. Revenue Calculation
                 let unitsPerPerson = 0;
                 
                 if (ev.roleId === 'trainer') {
@@ -229,7 +254,6 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
         const newNetCashflow = (op.netCashflow + generatedRevenue) - monthlyStaffCost;
         
         // Recalculate Balance
-        // For index 0, use original opening. For others, use running balance from previous iteration.
         const opening = index === 0 ? op.openingBalance : runningBalance;
         const closing = opening + newNetCashflow;
         runningBalance = closing;
@@ -248,9 +272,46 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
     });
   }, [data.operationalFinancials, hiringEvents, regionUnitValues, scheduleMonths]);
 
-  const totalProjectedCost = projectionData.reduce((acc, curr) => acc + curr.staffCost, 0);
-  const totalGeneratedRevenue = projectionData.reduce((acc, curr) => acc + curr.generatedRevenue, 0);
-  const netImpact = totalGeneratedRevenue - totalProjectedCost;
+  // Filtered View Data based on Analysis Period
+  const viewData = useMemo(() => {
+      if (!analysisStart || !analysisEnd) return projectionData;
+      
+      const startIdx = scheduleMonths.indexOf(analysisStart);
+      const endIdx = scheduleMonths.indexOf(analysisEnd);
+      
+      if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return projectionData;
+      
+      return projectionData.slice(startIdx, endIdx + 1);
+  }, [projectionData, analysisStart, analysisEnd, scheduleMonths]);
+
+  // Summary Stats for the selected Period
+  const summaryStats = useMemo(() => {
+    if (viewData.length === 0) return {
+        staffCost: 0, revenue: 0, netImpact: 0, 
+        endBalance: 0, baselineEndBalance: 0, 
+        periodNetCashflow: 0, baselineNetCashflow: 0
+    };
+
+    const staffCost = viewData.reduce((acc, curr) => acc + curr.staffCost, 0);
+    const revenue = viewData.reduce((acc, curr) => acc + curr.generatedRevenue, 0);
+    const netImpact = revenue - staffCost;
+    
+    const endBalance = viewData[viewData.length - 1].projectedBalance;
+    const baselineEndBalance = viewData[viewData.length - 1].baselineBalance;
+    
+    const periodNetCashflow = viewData.reduce((acc, curr) => acc + curr.projectedCashflow, 0);
+    const baselineNetCashflow = viewData.reduce((acc, curr) => acc + curr.baselineCashflow, 0);
+
+    return {
+        staffCost,
+        revenue,
+        netImpact,
+        endBalance,
+        baselineEndBalance,
+        periodNetCashflow,
+        baselineNetCashflow
+    };
+  }, [viewData]);
 
   const isRevenueGeneratingRole = selectedRole === 'trainer' || selectedRole === 'sales';
 
@@ -402,23 +463,6 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                                 </div>
                             );
                         })}
-                        
-                        <div className="pt-4 border-t border-slate-100 mt-4 space-y-2">
-                             <div className="flex justify-between items-center text-sm">
-                                 <span className="text-slate-500">Projected Cost</span>
-                                 <span className="font-medium text-rose-600">{formatCurrency(totalProjectedCost)}</span>
-                             </div>
-                             <div className="flex justify-between items-center text-sm">
-                                 <span className="text-slate-500">Generated Revenue</span>
-                                 <span className="font-medium text-emerald-600">{formatCurrency(totalGeneratedRevenue)}</span>
-                             </div>
-                             <div className="flex justify-between items-center border-t border-slate-200 pt-2">
-                                 <span className="font-bold text-slate-700">Net Impact</span>
-                                 <span className={`font-bold text-lg ${netImpact >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
-                                     {netImpact > 0 ? '+' : ''}{formatCurrency(netImpact)}
-                                 </span>
-                             </div>
-                        </div>
                     </div>
                   )}
               </div>
@@ -426,10 +470,73 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
 
           {/* Visualization */}
           <div className="lg:col-span-8 flex flex-col space-y-6">
-               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex-1 min-h-[350px]">
-                    <h3 className="font-bold text-slate-800 mb-6">Net Cashflow & Bank Balance Impact</h3>
+               {/* Analysis Controls & Summary */}
+               <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-100">
+                    <div className="flex flex-col lg:flex-row justify-between lg:items-center gap-4 mb-4 border-b border-slate-50 pb-4">
+                        <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                            <Activity size={18} className="text-indigo-600" />
+                            Financial Impact Analysis
+                        </h3>
+                        <div className="flex items-center gap-2 bg-slate-50 p-1.5 rounded-lg border border-slate-200">
+                            <select 
+                                value={analysisStart}
+                                onChange={(e) => setAnalysisStart(e.target.value)}
+                                className="text-sm bg-transparent border-none focus:ring-0 text-slate-700 font-medium"
+                            >
+                                {scheduleMonths.map(m => <option key={m} value={m}>{m}</option>)}
+                            </select>
+                            <ArrowRight size={14} className="text-slate-400" />
+                            <select 
+                                value={analysisEnd}
+                                onChange={(e) => setAnalysisEnd(e.target.value)}
+                                className="text-sm bg-transparent border-none focus:ring-0 text-slate-700 font-medium"
+                            >
+                                {scheduleMonths.map(m => <option key={m} value={m}>{m}</option>)}
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                        <div className="p-3 bg-indigo-50 rounded-lg border border-indigo-100">
+                            <p className="text-xs text-indigo-700 font-medium flex items-center gap-1.5 mb-1">
+                                <Wallet size={12} /> Cash Position (End)
+                            </p>
+                            <p className={`text-lg font-bold ${summaryStats.endBalance >= 0 ? 'text-indigo-900' : 'text-rose-700'}`}>
+                                {formatCurrency(summaryStats.endBalance)}
+                            </p>
+                            <p className="text-[10px] text-indigo-400">
+                                vs {formatCurrency(summaryStats.baselineEndBalance)}
+                            </p>
+                        </div>
+                        
+                        <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-100">
+                            <p className="text-xs text-emerald-700 font-medium flex items-center gap-1.5 mb-1">
+                                <DollarSign size={12} /> Net Cashflow (Period)
+                            </p>
+                            <p className={`text-lg font-bold ${summaryStats.periodNetCashflow >= 0 ? 'text-emerald-900' : 'text-rose-700'}`}>
+                                {formatCurrency(summaryStats.periodNetCashflow)}
+                            </p>
+                            <p className="text-[10px] text-emerald-600">
+                                vs {formatCurrency(summaryStats.baselineNetCashflow)}
+                            </p>
+                        </div>
+
+                         <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                            <p className="text-xs text-slate-500 font-medium mb-1">New Revenue (Period)</p>
+                            <p className="text-lg font-bold text-slate-700">{formatCurrency(summaryStats.revenue)}</p>
+                        </div>
+
+                        <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                            <p className="text-xs text-slate-500 font-medium mb-1">Staff Costs (Period)</p>
+                            <p className="text-lg font-bold text-rose-600">-{formatCurrency(summaryStats.staffCost)}</p>
+                        </div>
+                    </div>
+               </div>
+
+               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex-1 min-h-[300px]">
+                    <h3 className="font-bold text-slate-800 mb-6">Cash Position & Net Cashflow Impact</h3>
                     <ResponsiveContainer width="100%" height="100%">
-                        <ComposedChart key={`balance-chart-${hiringEvents.length}`} data={projectionData} margin={{top: 10, right: 30, left: 0, bottom: 0}}>
+                        <ComposedChart key={`balance-chart-${hiringEvents.length}-${analysisStart}-${analysisEnd}`} data={viewData} margin={{top: 10, right: 30, left: 10, bottom: 0}}>
                             <defs>
                                 <linearGradient id="splitColor" x1="0" y1="0" x2="0" y2="1">
                                     <stop offset="5%" stopColor="#6366f1" stopOpacity={0.1}/>
@@ -438,18 +545,47 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                             </defs>
                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                             <XAxis dataKey="month" fontSize={11} tickLine={false} axisLine={false} minTickGap={30} />
+                            
+                            {/* Left Axis: Cash Position */}
                             <YAxis 
+                                yAxisId="left"
                                 fontSize={11} 
                                 tickLine={false} 
                                 axisLine={false} 
                                 tickFormatter={(val) => `$${val/1000}k`} 
+                                label={{ value: 'Cash Position', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle', fill: '#94a3b8', fontSize: 10 } }}
                             />
+                            
+                            {/* Right Axis: Net Cashflow */}
+                            <YAxis 
+                                yAxisId="right"
+                                orientation="right"
+                                fontSize={11} 
+                                tickLine={false} 
+                                axisLine={false} 
+                                tickFormatter={(val) => `$${val/1000}k`}
+                                label={{ value: 'Net Cashflow', angle: 90, position: 'insideRight', style: { textAnchor: 'middle', fill: '#94a3b8', fontSize: 10 } }}
+                            />
+                            
                             <Tooltip 
-                                formatter={(value: number) => formatCurrency(value)}
+                                formatter={(value: number, name: string) => [formatCurrency(value), name]}
                                 contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
                             />
                             <Legend />
+                            
+                            {/* Net Cashflow Bar on Right Axis */}
+                            <Bar 
+                                yAxisId="right"
+                                dataKey="projectedCashflow" 
+                                name="Net Cashflow" 
+                                fill="#10b981" 
+                                opacity={0.3}
+                                barSize={24}
+                                radius={[4, 4, 0, 0]}
+                            />
+
                             <Line 
+                                yAxisId="left"
                                 type="monotone" 
                                 dataKey="baselineBalance" 
                                 name="Baseline Balance" 
@@ -459,6 +595,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                                 strokeDasharray="5 5"
                             />
                             <Line 
+                                yAxisId="left"
                                 type="monotone" 
                                 dataKey="projectedBalance" 
                                 name="Projected Balance" 
@@ -467,6 +604,7 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                                 dot={false} 
                             />
                             <Area
+                                yAxisId="left"
                                 type="monotone"
                                 dataKey="projectedBalance"
                                 stroke="none"
@@ -477,9 +615,9 @@ const StaffPlanner: React.FC<Props> = ({ data }) => {
                </div>
 
                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 h-80">
-                    <h3 className="font-bold text-slate-800 mb-4">Staff Costs vs. Generated Revenue (ROI)</h3>
+                    <h3 className="font-bold text-slate-800 mb-4">Staff Costs vs. Revenue vs Net Cashflow</h3>
                      <ResponsiveContainer width="100%" height="100%">
-                        <ComposedChart key={`roi-chart-${hiringEvents.length}`} data={projectionData}>
+                        <ComposedChart key={`roi-chart-${hiringEvents.length}-${analysisStart}-${analysisEnd}`} data={viewData}>
                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                             <XAxis dataKey="month" fontSize={11} tickLine={false} axisLine={false} minTickGap={30} />
                             <YAxis fontSize={11} tickLine={false} axisLine={false} tickFormatter={(val) => `$${val/1000}k`} />
